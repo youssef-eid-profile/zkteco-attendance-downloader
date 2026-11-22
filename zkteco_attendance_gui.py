@@ -73,7 +73,7 @@ class DownloadWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, ip, port, password, start_dt, end_dt,
-                 out_dat, out_xlsx, parent=None):
+                 out_dat, out_xlsx, force_udp=False, parent=None):
         super().__init__(parent)
         self.ip = ip
         self.port = int(port)
@@ -82,6 +82,7 @@ class DownloadWorker(QThread):
         self.end_dt = end_dt
         self.out_dat = out_dat
         self.out_xlsx = out_xlsx
+        self.force_udp = force_udp
 
     def _log(self, level, msg):
         # Also write to stdout so it shows up when launched from a terminal
@@ -93,15 +94,20 @@ class DownloadWorker(QThread):
         conn = None
         try:
             self.busy.emit(True)
-            self._log("info", "Connecting to {}:{} (password={}, UDP=False, ommit_ping=True)…".format(
-                self.ip, self.port, self.password))
+            proto = "UDP" if self.force_udp else "TCP"
+            self._log("info", "Connecting to {}:{} (password={}, protocol={}, ommit_ping=True)…".format(
+                self.ip, self.port, self.password, proto))
 
             # NOTE: pyzk's keyword is spelled 'ommit_ping' (two m's, ONE t).
             # The original standalone script had a typo 'omitt_ping' which
             # pyzk 0.9 rejects with TypeError — that was the root cause of
             # downloads silently failing. Fixed here.
+            #
+            # Protocol: many ZKTeco devices only speak UDP. If you see
+            # "TCP packet invalid" with TCP, switch to UDP.
             zk = ZK(self.ip, port=self.port, timeout=15,
-                    password=self.password, force_udp=False, ommit_ping=True)
+                    password=self.password, force_udp=self.force_udp,
+                    ommit_ping=True)
             conn = zk.connect()
             self._log("ok", "Connected. Disabling device for live capture…")
             conn.disable_device()
@@ -189,6 +195,74 @@ class DownloadWorker(QThread):
 
 
 # ----------------------------------------------------------------------------
+# Test-connection worker (does not download anything, just probes)
+# ----------------------------------------------------------------------------
+class TestConnectionWorker(QThread):
+    """Probes the device with the chosen protocol. Emits one of:
+       finished_ok(str)  - connected, returns device firmware + serial
+       error(str)         - the exception message
+    """
+
+    log = pyqtSignal(str, str)
+    finished_ok = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, ip, port, password, force_udp=False, parent=None):
+        super().__init__(parent)
+        self.ip = ip
+        self.port = int(port)
+        self.password = int(password)
+        self.force_udp = force_udp
+
+    def _log(self, level, msg):
+        print("[{}] {}".format(level.upper(), msg), flush=True)
+        self.log.emit(level, msg)
+
+    def run(self):
+        conn = None
+        try:
+            proto = "UDP" if self.force_udp else "TCP"
+            self._log("info", "Testing {} {}:{} (password={})…".format(
+                proto, self.ip, self.port, self.password))
+            zk = ZK(self.ip, port=self.port, timeout=8,
+                    password=self.password, force_udp=self.force_udp,
+                    ommit_ping=True)
+            conn = zk.connect()
+            self._log("ok", "Connected ({}).".format(proto))
+            # Read a couple of cheap identifying fields.
+            info_bits = []
+            try:
+                fw = conn.get_firmware_version()
+                info_bits.append("firmware={}".format(fw))
+            except Exception as e:
+                self._log("warn", "get_firmware_version failed: {}".format(e))
+            try:
+                serial = conn.get_serialnumber()
+                info_bits.append("serial={}".format(serial))
+            except Exception as e:
+                self._log("warn", "get_serialnumber failed: {}".format(e))
+            summary = "Connected via {}. {}".format(proto, ", ".join(info_bits))
+            self.finished_ok.emit(summary)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._log("err", "Test failed: {}".format(e))
+            self._log("err", tb)
+            self.error.emit("Could not connect via {}: {}\n\n"
+                            "Tip: try the other protocol "
+                            "(switch TCP ↔ UDP in the GUI).".format(proto, e))
+        finally:
+            if conn is not None:
+                try:
+                    conn.enable_device()
+                except Exception:
+                    pass
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+
+
+# ----------------------------------------------------------------------------
 # Main window
 # ----------------------------------------------------------------------------
 class MainWindow(QWidget):
@@ -225,9 +299,28 @@ class MainWindow(QWidget):
         self.password_edit.setReadOnly(True)
         self.password_edit.setStyleSheet("background-color: #f0f0f0;")
 
+        # Protocol selector: TCP (default) or UDP.
+        # Many ZKTeco devices only speak UDP and fail with
+        # "TCP packet invalid" when you try TCP. If TCP fails, switch to UDP.
+        self.proto_combo = QComboBox()
+        self.proto_combo.addItems(["TCP (default)", "UDP (try if TCP fails)"])
+        self.proto_combo.setToolTip(
+            "Most ZKTeco devices speak UDP on port 4370. pyzk defaults to "
+            "TCP. If you get 'TCP packet invalid', switch to UDP.")
+
         dev_form.addRow("Device IP:", self.ip_edit)
         dev_form.addRow("Port:", self.port_edit)
         dev_form.addRow("Password:", self.password_edit)
+        dev_form.addRow("Protocol:", self.proto_combo)
+
+        # Test-connection button (probes without downloading anything).
+        self.test_btn = QPushButton("Test connection")
+        self.test_btn.setToolTip(
+            "Connect to the device with the current settings and report "
+            "the firmware + serial. Does NOT download attendance data.")
+        self.test_btn.clicked.connect(self.on_test_connection)
+        dev_form.addRow("", self.test_btn)
+
         root.addWidget(dev_box)
 
         # ---- Date range group ------------------------------------------
@@ -349,6 +442,7 @@ class MainWindow(QWidget):
         self._append_log("info", "Ready. Fill in the device IP and date range, then click Download.")
 
         self.worker = None
+        self.test_worker = None
         self.last_out_dir = None
 
     # ---- helpers ----------------------------------------------------------
@@ -367,7 +461,9 @@ class MainWindow(QWidget):
     def _set_running(self, running):
         self.download_btn.setEnabled(not running)
         self.open_folder_btn.setEnabled(False)
+        self.test_btn.setEnabled(not running)
         self.ip_edit.setEnabled(not running)
+        self.proto_combo.setEnabled(not running)
         self.start_date_edit.setEnabled(not running)
         self.end_date_edit.setEnabled(not running)
         self.path_edit.setEnabled(not running)
@@ -434,8 +530,10 @@ class MainWindow(QWidget):
 
         self._set_running(True)
         self.progress.setRange(0, 0)  # indeterminate / busy
+        proto = "UDP" if self.proto_combo.currentIndex() == 1 else "TCP"
         self._append_log("info", "─── New download started ───")
         self._append_log("info", "IP        : {}:{}".format(ip, port))
+        self._append_log("info", "Protocol : {}".format(proto))
         self._append_log("info", "Date range: {} → {}".format(
             start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             end_dt.strftime("%Y-%m-%d %H:%M:%S")))
@@ -446,12 +544,57 @@ class MainWindow(QWidget):
             ip=ip, port=port, password=password,
             start_dt=start_dt, end_dt=end_dt,
             out_dat=out_dat, out_xlsx=out_xlsx,
+            force_udp=(self.proto_combo.currentIndex() == 1),
         )
         self.worker.log.connect(self._append_log)
         self.worker.busy.connect(self.on_busy)
         self.worker.finished_ok.connect(self.on_finished_ok)
         self.worker.error.connect(self.on_error)
         self.worker.start()
+
+    def on_test_connection(self):
+        """Probe the device with the chosen protocol without downloading."""
+        ip = self.ip_edit.text().strip()
+        if not ip or ip == "0.0.0.0":
+            QMessageBox.warning(self, "Missing IP",
+                "Please enter the device IP (e.g. 192.168.1.201) before testing.")
+            return
+        try:
+            port = int(self.port_edit.text())
+            password = int(self.password_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Bad input",
+                "Port and Password must be integers.")
+            return
+
+        force_udp = (self.proto_combo.currentIndex() == 1)
+        proto = "UDP" if force_udp else "TCP"
+        self._append_log("info", "─── Testing connection ({}) ───".format(proto))
+        self._set_running(True)
+        self.progress.setRange(0, 0)
+
+        self.test_worker = TestConnectionWorker(
+            ip=ip, port=port, password=password, force_udp=force_udp)
+        self.test_worker.log.connect(self._append_log)
+        self.test_worker.finished_ok.connect(self.on_test_ok)
+        self.test_worker.error.connect(self.on_test_error)
+        self.test_worker.start()
+
+    def on_test_ok(self, msg):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        self._append_log("ok", "TEST OK: {}".format(msg))
+        self._set_running(False)
+        QMessageBox.information(self, "Connection OK", msg +
+            "\n\nYou can now click Download.")
+
+    def on_test_error(self, msg):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self._append_log("err", "TEST FAILED: see popup.")
+        self._set_running(False)
+        QMessageBox.critical(self, "Connection failed", msg +
+            "\n\nThe full log is preserved in the Log panel below.")
 
     def on_busy(self, busy):
         self.progress.setRange(0, 0) if busy else self.progress.setRange(0, 100)
