@@ -1,0 +1,5 @@
+# ZKTeco Attendance Downloader (GUI)
+# Install with: pip install -r requirements.txt
+PyQt5>=5.15
+pyzk>=0.9
+openpyxl>=3.0

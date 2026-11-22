@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---------------------------------------------------------------------------
+# PyInstaller
+# ---------------------------------------------------------------------------
+*.manifest
+*.spec.bak
+
+# ---------------------------------------------------------------------------
+# PyQt5 / Qt
+# ---------------------------------------------------------------------------
+# Qt Creator / Designer temp files
+*.pro.user
+*.qmlproject.user*
+CMakeLists.txt.user*
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Logs / databases / local artifacts
+# ---------------------------------------------------------------------------
+*.log
+*.dat
+*.xlsx
+!requirements.txt
+
+# Local output files created by the app at runtime
+1_attlog.*
+
+# ---------------------------------------------------------------------------
+# OS / misc
+# ---------------------------------------------------------------------------
+*.tmp
+*.bak
+.cache/
