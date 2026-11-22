@@ -40,8 +40,8 @@ Three ways, depending on who you are:
 ### B. Run from source (no build)
 
 ```bash
-git clone https://github.com/<your-user>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/youssef-eid-profile/zkteco-attendance-downloader.git
+cd zkteco-attendance-downloader
 # Windows: double-click run.bat
 # Or manually:
 pip install -r requirements.txt
@@ -51,8 +51,8 @@ python zkteco_attendance_gui.py
 ### C. Build the `.exe` yourself
 
 ```bash
-git clone https://github.com/<your-user>/<your-repo>.git
-cd <your-repo>
+git https://github.com/youssef-eid-profile/zkteco-attendance-downloader.git
+cd zkteco-attendance-downloader
 # Windows: double-click build_exe.bat
 ```
 
