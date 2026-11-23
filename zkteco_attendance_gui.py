@@ -73,7 +73,8 @@ class DownloadWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, ip, port, password, start_dt, end_dt,
-                 out_dat, out_xlsx, force_udp=False, parent=None):
+                 out_dat, out_xlsx, force_udp=False, status_override=None,
+                 parent=None):
         super().__init__(parent)
         self.ip = ip
         self.port = int(port)
@@ -83,12 +84,23 @@ class DownloadWorker(QThread):
         self.out_dat = out_dat
         self.out_xlsx = out_xlsx
         self.force_udp = force_udp
+        # status_override: None = use device value; 0 = force Check-In;
+        # 1 = force Check-Out. Written to col4 of the .dat file.
+        self.status_override = status_override
 
     def _log(self, level, msg):
         # Also write to stdout so it shows up when launched from a terminal
         # and gets captured by PyInstaller's noconsole redirect if any.
         print("[{}] {}".format(level.upper(), msg), flush=True)
         self.log.emit(level, msg)
+
+    def _effective_status(self, raw_status):
+        """Return the status to actually write to the file, honoring the
+        status override. None / -1 = use device value; 0 = Check-In;
+        1 = Check-Out."""
+        if self.status_override in (0, 1):
+            return self.status_override
+        return raw_status
 
     def run(self):
         conn = None
@@ -132,14 +144,31 @@ class DownloadWorker(QThread):
                 d = os.path.dirname(os.path.abspath(self.out_dat))
                 if not os.path.isdir(d):
                     os.makedirs(d, exist_ok=True)
+                # comsys.dat format (verified byte-for-byte against a working
+                # comsys-imported file):
+                #   <uid>\t<ts>\t1\t<status>\t<verify_type>\t0\r\n
+                # Differences from the original standalone script:
+                #   - CRLF line endings (comsys is a Windows app and rejects
+                #     LF-only files).
+                #   - col3 is always "1" (comsys uses this as a fixed marker;
+                #     it is NOT the punch/verification type).
+                #   - col5 carries the verify type (1=fingerprint, 2=other),
+                #     NOT a literal "0".
+                #   - col6 stays "0" (reserved, matches comsys.dat).
                 with open(self.out_dat, "w", newline="") as f:
                     for a in filtered:
+                        # Map pyzk punch -> comsys verify-type column.
+                        # pyzk: 0=Fingerprint, 1=Face, 2=Password, 3=Card,
+                        #       4=Palm, 5=Iris, 15=multi-biometric.
+                        # comsys: 1=Fingerprint, 2=Other (face/card/etc.).
+                        verify_type = 1 if a.punch == 0 else 2
+                        status = self._effective_status(a.status)
                         f.write(
-                            "{uid}\t{ts}\t{punch}\t{status}\t0\t0\n".format(
+                            "{uid}\t{ts}\t1\t{status}\t{vtype}\t0\r\n".format(
                                 uid=str(a.user_id).rjust(9),
                                 ts=a.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                                punch=a.punch,
-                                status=a.status,
+                                status=status,
+                                vtype=verify_type,
                             )
                         )
                 size = os.path.getsize(self.out_dat)
@@ -154,15 +183,20 @@ class DownloadWorker(QThread):
                 wb = Workbook()
                 ws = wb.active
                 ws.title = "Attendance"
-                ws.append(["User ID", "Timestamp", "Punch", "Status"])
+                # Include both the raw device status (for reference) and the
+                # effective status (what was written to the .dat file, after
+                # applying the override).
+                ws.append(["User ID", "Timestamp", "Punch",
+                           "Status (raw)", "Status (written)"])
                 for a in filtered:
                     ws.append([
                         str(a.user_id),
                         a.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                         a.punch,
                         a.status,
+                        self._effective_status(a.status),
                     ])
-                widths = [12, 20, 8, 8]
+                widths = [12, 20, 8, 12, 14]
                 for i, w in enumerate(widths, start=1):
                     col = ws.cell(row=1, column=i).column_letter
                     ws.column_dimensions[col].width = w
@@ -378,6 +412,22 @@ class MainWindow(QWidget):
             "Only .xlsx",
         ])
 
+        # Status override: lets you force col4 (Check-In=0 / Check-Out=1) in
+        # the .dat file. Useful when the device returns an unexpected status
+        # value, or when comsys expects a specific status. "From device" keeps
+        # the raw value pyzk read from the device.
+        self.status_combo = QComboBox()
+        self.status_combo.addItems([
+            "From device (use raw value)",
+            "Force 0 (Check-In)",
+            "Force 1 (Check-Out)",
+        ])
+        self.status_combo.setToolTip(
+            "col4 in the .dat file. Most comsys imports expect 0 (Check-In).\n"
+            "If your device returns all 1's and comsys rejects the file, "
+            "try forcing to 0.")
+        self.status_combo.setCurrentIndex(0)
+
         # Default output base path = next to the exe/script (so files are
         # easy to find), with a fallback to the user's home.
         if getattr(sys, "frozen", False):
@@ -395,6 +445,7 @@ class MainWindow(QWidget):
         path_w = QWidget(); path_w.setLayout(path_row)
 
         out_form.addRow("Format:", self.format_combo)
+        out_form.addRow("Status override:", self.status_combo)
         out_form.addRow("Output path:", path_w)
         root.addWidget(out_box)
 
@@ -469,6 +520,7 @@ class MainWindow(QWidget):
         self.path_edit.setEnabled(not running)
         self.browse_btn.setEnabled(not running)
         self.format_combo.setEnabled(not running)
+        self.status_combo.setEnabled(not running)
 
     # ---- handlers --------------------------------------------------------
     def on_browse(self):
@@ -531,9 +583,22 @@ class MainWindow(QWidget):
         self._set_running(True)
         self.progress.setRange(0, 0)  # indeterminate / busy
         proto = "UDP" if self.proto_combo.currentIndex() == 1 else "TCP"
+        # Resolve status override: index 0 = from device, 1 = force 0,
+        # 2 = force 1.
+        so_idx = self.status_combo.currentIndex()
+        if so_idx == 1:
+            status_override = 0
+            status_label = "force 0 (Check-In)"
+        elif so_idx == 2:
+            status_override = 1
+            status_label = "force 1 (Check-Out)"
+        else:
+            status_override = None
+            status_label = "from device"
         self._append_log("info", "─── New download started ───")
         self._append_log("info", "IP        : {}:{}".format(ip, port))
         self._append_log("info", "Protocol : {}".format(proto))
+        self._append_log("info", "Status   : {}".format(status_label))
         self._append_log("info", "Date range: {} → {}".format(
             start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             end_dt.strftime("%Y-%m-%d %H:%M:%S")))
@@ -545,6 +610,7 @@ class MainWindow(QWidget):
             start_dt=start_dt, end_dt=end_dt,
             out_dat=out_dat, out_xlsx=out_xlsx,
             force_udp=(self.proto_combo.currentIndex() == 1),
+            status_override=status_override,
         )
         self.worker.log.connect(self._append_log)
         self.worker.busy.connect(self.on_busy)
